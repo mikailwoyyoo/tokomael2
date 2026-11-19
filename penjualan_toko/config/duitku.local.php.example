@@ -1,0 +1,9 @@
+<?php
+
+return [
+    'merchant_code' => 'DS38203',
+    'api_key' => '1c06fc8df712042052b595daa2b23802',
+    'environment' => 'sandbox',
+    'base_url' => 'https://armful-scoreless-smock.ngrok-free.dev/tokokita/penjualan_toko',
+    'expiry_period' => 60,
+];

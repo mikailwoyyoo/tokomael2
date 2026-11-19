@@ -5,15 +5,32 @@ document.addEventListener('DOMContentLoaded', function () {
     var sidebar = document.getElementById('sidebar');
 
     if (toggle && sidebar) {
+        var closeMenu = function () {
+            sidebar.classList.remove('open');
+            document.body.classList.remove('nav-open');
+            toggle.setAttribute('aria-expanded', 'false');
+            toggle.setAttribute('aria-label', 'Buka navigasi');
+            toggle.textContent = '☰';
+        };
         toggle.addEventListener('click', function () {
-            sidebar.classList.toggle('open');
+            var isOpen = sidebar.classList.toggle('open');
+            document.body.classList.toggle('nav-open', isOpen);
+            toggle.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+            toggle.setAttribute('aria-label', isOpen ? 'Tutup navigasi' : 'Buka navigasi');
+            toggle.textContent = isOpen ? '×' : '☰';
         });
 
         document.addEventListener('click', function (event) {
             if (window.innerWidth <= 760 && sidebar.classList.contains('open')
                 && !sidebar.contains(event.target) && !toggle.contains(event.target)) {
-                sidebar.classList.remove('open');
+                closeMenu();
             }
+        });
+        document.addEventListener('keydown', function (event) {
+            if (event.key === 'Escape' && sidebar.classList.contains('open')) closeMenu();
+        });
+        sidebar.querySelectorAll('a').forEach(function (link) {
+            link.addEventListener('click', closeMenu);
         });
     }
 

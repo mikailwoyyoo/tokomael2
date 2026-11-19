@@ -3,9 +3,10 @@
 require __DIR__ . '/includes/helpers.php';
 requireRole(['member']);
 require __DIR__ . '/config/database.php';
+require_once __DIR__ . '/includes/duitku.php';
 
 $memberQuery = $pdo->prepare(
-    'SELECT m.id_member, m.id_pelanggan, m.diskon_persen, p.nama_pelanggan
+    'SELECT m.id_member, m.id_pelanggan, m.card_code, m.diskon_persen, p.nama_pelanggan
      FROM tbl_member m
      JOIN tbl_pelanggan p ON p.id_pelanggan = m.id_pelanggan
      WHERE m.id_member = ? AND m.aktif = 1'
@@ -17,13 +18,6 @@ if (!$member) {
     exit('Akun member tidak aktif.');
 }
 
-$qrisImage = $pdo->query(
-    'SELECT gambar_path FROM tbl_pengaturan_qris WHERE id_qris = 1'
-)->fetchColumn();
-if (!is_string($qrisImage) || $qrisImage === '') {
-    $qrisImage = null;
-}
-
 if (!isset($_SESSION['online_cart']) || !is_array($_SESSION['online_cart'])) {
     $_SESSION['online_cart'] = [];
 }
@@ -33,6 +27,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         && (($_POST['action'] ?? '') === 'add');
     $newProof = null;
     $oldProof = null;
+    $gatewayRedirect = null;
+    $createdOrderId = null;
+    $invoiceCreated = false;
     try {
         verifyCsrfToken($_POST['csrf_token'] ?? null);
         $action = (string) ($_POST['action'] ?? '');
@@ -98,12 +95,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (!$cart) {
                 throw new InvalidArgumentException('Keranjang masih kosong.');
             }
-            if (!$qrisImage) {
-                throw new InvalidArgumentException('QRIS toko belum diatur. Hubungi Admin sebelum membuat pesanan.');
+            $selectedPaymentMethod = strtoupper(trim((string) ($_POST['payment_method'] ?? '')));
+            if (preg_match('/^[A-Z0-9]{2}$/D', $selectedPaymentMethod) !== 1) {
+                throw new InvalidArgumentException('Pilih metode pembayaran non-tunai yang tersedia.');
             }
-            if (($_POST['payment_method'] ?? '') !== 'QRIS') {
-                throw new InvalidArgumentException('Metode pembayaran pesanan online harus menggunakan QRIS.');
+            assertDuitkuConfigured();
+            $customerEmail = trim((string) ($_POST['customer_email'] ?? ''));
+            $customerPhone = preg_replace('/[^0-9+]/', '', (string) ($_POST['customer_phone'] ?? ''));
+            if (!filter_var($customerEmail, FILTER_VALIDATE_EMAIL)) {
+                throw new InvalidArgumentException('Masukkan alamat email yang valid untuk pembayaran Duitku.');
             }
+            if (strlen($customerPhone) > 32) {
+                throw new InvalidArgumentException('Nomor telepon terlalu panjang.');
+            }
+            $_SESSION['online_checkout_email'] = $customerEmail;
+            $_SESSION['online_checkout_phone'] = $customerPhone;
+            $_SESSION['online_payment_method'] = $selectedPaymentMethod;
             $productIds = array_map('intval', array_keys($cart));
             sort($productIds, SORT_NUMERIC);
             $pdo->beginTransaction();
@@ -144,25 +151,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $subtotal = round($subtotal, 2);
             $discount = round($subtotal * (float) $lockedMember['diskon_persen'] / 100, 2);
             $tax = round(($subtotal - $discount) * 0.11, 2);
-            $total = round($subtotal - $discount + $tax, 2);
+            $total = (float) round($subtotal - $discount + $tax);
             $orderNumber = 'OL' . date('ymd') . strtoupper(bin2hex(random_bytes(4)));
             $createOrder = $pdo->prepare(
                 'INSERT INTO tbl_pesanan_online
-                    (nomor_pesanan, id_pelanggan, id_member, status, subtotal, diskon, pajak, total, metode_pembayaran)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+                    (nomor_pesanan, id_pelanggan, id_member, email_pelanggan, telepon_pelanggan,
+                     status, subtotal, diskon, pajak, total, metode_pembayaran, status_pembayaran,
+                     duitku_payment_method)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
             );
             $createOrder->execute([
                 $orderNumber,
                 (int) $lockedMember['id_pelanggan'],
                 (int) $lockedMember['id_member'],
+                $customerEmail,
+                $customerPhone !== '' ? $customerPhone : null,
                 'Menunggu',
                 $subtotal,
                 $discount,
                 $tax,
                 $total,
-                'QRIS',
+                'Duitku',
+                'Menunggu pembayaran',
+                $selectedPaymentMethod,
             ]);
             $orderId = (int) $pdo->lastInsertId();
+            $createdOrderId = $orderId;
             $addDetail = $pdo->prepare(
                 'INSERT INTO tbl_detail_pesanan_online
                     (id_pesanan, id_produk, nama_produk, jumlah, harga)
@@ -187,8 +201,69 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
             }
             $pdo->commit();
+            $availableMethods = duitkuGetNonCashPaymentMethods((int) round($total));
+            $selectedMethod = null;
+            foreach ($availableMethods as $availableMethod) {
+                if ($availableMethod['code'] === $selectedPaymentMethod) {
+                    $selectedMethod = $availableMethod;
+                    break;
+                }
+            }
+            if ($selectedMethod === null) {
+                throw new InvalidArgumentException('Metode pembayaran yang dipilih sudah tidak tersedia untuk nominal ini. Pilih metode lain.');
+            }
+            $saveMethodName = $pdo->prepare(
+                'UPDATE tbl_pesanan_online SET duitku_payment_name = ? WHERE id_pesanan = ?'
+            );
+            $saveMethodName->execute([$selectedMethod['name'], $orderId]);
+            $itemDetails = [[
+                'name' => 'Pesanan MKLOYY ' . $orderNumber,
+                'price' => (int) round($total),
+                'quantity' => 1,
+            ]];
+            $invoice = duitkuCreateInvoice(
+                $orderNumber,
+                (int) round($total),
+                (string) $member['nama_pelanggan'],
+                $customerEmail,
+                $customerPhone,
+                $itemDetails,
+                $selectedPaymentMethod
+            );
+            $invoiceCreated = true;
+            $saveInvoice = $pdo->prepare(
+                'UPDATE tbl_pesanan_online
+                 SET duitku_reference = ?, duitku_payment_url = ?, duitku_payment_code = ?, duitku_qr_string = ?
+                 WHERE id_pesanan = ? AND status_pembayaran = ?'
+            );
+            $saveInvoice->execute([
+                (string) $invoice['reference'],
+                (string) $invoice['paymentUrl'],
+                $selectedPaymentMethod,
+                isset($invoice['qrString']) ? (string) $invoice['qrString'] : null,
+                $orderId,
+                'Menunggu pembayaran',
+            ]);
+            $confirmOrder = $pdo->prepare(
+                'SELECT status_pembayaran, duitku_reference, duitku_payment_url
+                 FROM tbl_pesanan_online WHERE id_pesanan = ?'
+            );
+            $confirmOrder->execute([$orderId]);
+            $savedOrder = $confirmOrder->fetch();
+            if (!$savedOrder
+                || $savedOrder['duitku_reference'] !== (string) $invoice['reference']
+                || !in_array($savedOrder['status_pembayaran'], ['Menunggu pembayaran', 'Dibayar'], true)
+                || ($savedOrder['status_pembayaran'] === 'Menunggu pembayaran'
+                    && $savedOrder['duitku_payment_url'] !== (string) $invoice['paymentUrl'])) {
+                throw new RuntimeException('Invoice Duitku berhasil dibuat tetapi gagal ditautkan ke pesanan. Hubungi Admin sebelum membayar.');
+            }
             $_SESSION['online_cart'] = [];
-            setFlash('success', 'Pesanan ' . $orderNumber . ' berhasil dibuat. Scan QRIS lalu unggah bukti pembayaran pada riwayat pesanan.');
+            $gatewayRedirect = $savedOrder['status_pembayaran'] === 'Dibayar'
+                ? null
+                : (string) $invoice['paymentUrl'];
+            setFlash('success', $savedOrder['status_pembayaran'] === 'Dibayar'
+                ? 'Pesanan ' . $orderNumber . ' berhasil dibayar dan siap diambil.'
+                : 'Pesanan ' . $orderNumber . ' dibuat. Selesaikan pembayaran ' . $selectedMethod['name'] . ' di halaman Duitku.');
         } else {
             throw new InvalidArgumentException('Aksi keranjang tidak dikenal.');
         }
@@ -199,6 +274,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($newProof !== null) {
             removeUploadedImage($newProof, 'qris_proofs');
         }
+        if ($createdOrderId !== null && !$invoiceCreated && !$pdo->inTransaction()) {
+            try {
+                duitkuFailOnlineOrder($pdo, $createdOrderId);
+            } catch (Throwable $cleanupException) {
+                error_log('Unable to release stock after failed Duitku invoice: ' . $cleanupException->getMessage());
+            }
+        }
         if ($exception instanceof InvalidArgumentException) {
             setFlash('error', $exception->getMessage());
         } elseif ($exception instanceof PDOException) {
@@ -208,6 +290,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             error_log('Unexpected online order error: ' . $exception->getMessage());
             setFlash('error', $exception->getMessage());
         }
+    }
+
+    if ($gatewayRedirect !== null) {
+        header('Location: ' . $gatewayRedirect);
+        exit;
     }
 
     header('Location: ' . ($returnToDashboard ? 'dashboard_pelanggan.php' : 'belanja_online.php'));
@@ -241,18 +328,44 @@ $products = $pdo->query(
      FROM tbl_produk WHERE stok > 0 ORDER BY nama_produk'
 )->fetchAll();
 $ordersQuery = $pdo->prepare(
-    'SELECT id_pesanan, nomor_pesanan, status, status_pembayaran, bukti_pembayaran, subtotal, diskon, pajak, total, dibuat_pada
+    'SELECT id_pesanan, nomor_pesanan, status, status_pembayaran, metode_pembayaran, bukti_pembayaran,
+            duitku_payment_url, duitku_reference, duitku_payment_method, duitku_payment_name,
+            subtotal, diskon, pajak, total, dibuat_pada
      FROM tbl_pesanan_online WHERE id_member = ? ORDER BY dibuat_pada DESC LIMIT 50'
 );
 $ordersQuery->execute([(int) $member['id_member']]);
 $orders = $ordersQuery->fetchAll();
+$duitkuReady = false;
+$duitkuSetupError = null;
+$paymentMethods = [];
+if ($cartProducts && $total > 0) {
+    try {
+        assertDuitkuCredentialsConfigured();
+        $paymentMethods = duitkuGetNonCashPaymentMethods((int) round($total));
+        if (!$paymentMethods) {
+            $duitkuSetupError = 'Duitku tidak menyediakan metode non-tunai untuk nominal keranjang ini.';
+        } else {
+            try {
+                assertDuitkuConfigured();
+                $duitkuReady = true;
+            } catch (RuntimeException $exception) {
+                $duitkuSetupError = 'Metode tersedia, tetapi checkout memerlukan callback publik HTTPS. ' . $exception->getMessage();
+            }
+        }
+    } catch (RuntimeException $exception) {
+        $duitkuSetupError = $exception->getMessage();
+    }
+}
+$checkoutEmail = (string) ($_SESSION['online_checkout_email'] ?? '');
+$checkoutPhone = (string) ($_SESSION['online_checkout_phone'] ?? '');
+$selectedPaymentMethod = (string) ($_SESSION['online_payment_method'] ?? '');
 $flash = takeFlash();
 $pageTitle = 'Belanja Online';
 $activePage = 'shop';
 require __DIR__ . '/includes/header.php';
 ?>
 <section class="page-heading">
-    <div><div class="eyebrow">Belanja member</div><h1>Katalog Produk</h1><p>Pesan dari rumah, bayar dengan QRIS, lalu ambil barang di toko.</p></div>
+    <div><div class="eyebrow">Belanja member</div><h1>Katalog Produk</h1><p>Pesan dari rumah, pilih pembayaran non-tunai, lalu ambil barang di toko.</p></div>
     <a class="button button-secondary" href="dashboard_pelanggan.php">← Kembali ke dashboard</a>
 </section>
 <?php if ($flash): ?><div class="notice <?= h($flash['type']) ?>"><?= h($flash['message']) ?></div><?php endif; ?>
@@ -285,29 +398,56 @@ require __DIR__ . '/includes/header.php';
             </div>
             <?php endforeach; ?>
         </div>
-        <div class="online-cart-summary"><div><span>Subtotal</span><strong><?= rupiah($subtotal) ?></strong></div><div><span>Diskon member (<?= h(number_format((float) $member['diskon_persen'], 2, ',', '.')) ?>%)</span><strong>− <?= rupiah($discount) ?></strong></div><div><span>Pajak</span><strong><?= rupiah($tax) ?></strong></div><div class="online-cart-total"><span>Total</span><strong><?= rupiah($total) ?></strong></div></div>
-        <div class="online-qris-checkout">
-            <div class="online-qris-heading"><span class="online-qris-icon">▦</span><div><strong>Bayar dengan QRIS</strong><small>Scan QRIS setelah pesanan dibuat.</small></div></div>
-            <?php if ($qrisImage): ?><img src="<?= h($qrisImage) ?>" alt="QRIS pembayaran MKLOYY" loading="lazy">
-            <?php else: ?><div class="online-qris-unavailable">QRIS toko belum diatur. Hubungi Admin.</div><?php endif; ?>
-            <p>Masukkan nominal sesuai total pesanan dan gunakan nomor pesanan sebagai catatan jika aplikasi pembayaran mendukungnya. Setelah transfer, unggah bukti di riwayat; Admin/Kasir akan memverifikasi pembayaran.</p>
+        <div class="member-discount-callout">
+            <span class="member-discount-icon" aria-hidden="true">M</span>
+            <div class="member-discount-copy">
+                <strong>Kartu member aktif</strong>
+                <span><?= h($member['card_code']) ?></span>
+            </div>
+            <span class="member-discount-rate"><?= h(number_format((float) $member['diskon_persen'], 2, ',', '.')) ?>%</span>
         </div>
-        <form method="post" class="online-checkout-form"><input type="hidden" name="csrf_token" value="<?= h(csrfToken()) ?>"><input type="hidden" name="action" value="checkout"><input type="hidden" name="payment_method" value="QRIS"><div class="online-payment-selected"><span>Metode pembayaran</span><strong>QRIS</strong></div><button class="button button-primary" type="submit" <?= !$qrisImage ? 'disabled title="QRIS toko belum diatur"' : '' ?>>Buat pesanan · <?= rupiah($total) ?></button></form>
+        <div class="online-cart-summary">
+            <div><span>Subtotal</span><strong><?= rupiah($subtotal) ?></strong></div>
+            <div class="member-savings-row"><span>Diskon kartu member</span><strong>− <?= rupiah($discount) ?></strong></div>
+            <div><span>Pajak</span><strong><?= rupiah($tax) ?></strong></div>
+            <div class="online-cart-total"><span>Total pembayaran</span><strong><?= rupiah($total) ?></strong></div>
+        </div>
+        <div class="online-qris-checkout">
+            <div class="online-qris-heading"><span class="online-qris-icon">▦</span><div><strong>Pembayaran online melalui Duitku</strong><small>Transfer bank, virtual account, e-wallet, kartu, QRIS, dan kanal aktif lain.</small></div></div>
+            <p>Tunai tidak tersedia untuk belanja online. Pilih kanal pembayaran yang aktif; status pembayaran akan dikonfirmasi otomatis oleh Duitku.</p>
+        </div>
+        <?php if (!$duitkuReady): ?><div class="notice error online-duitku-warning">Pembayaran online belum siap. <?= h($duitkuSetupError) ?></div><?php endif; ?>
+        <form method="post" class="online-checkout-form">
+            <input type="hidden" name="csrf_token" value="<?= h(csrfToken()) ?>"><input type="hidden" name="action" value="checkout">
+            <label class="online-payment-method">Metode pembayaran
+                <select name="payment_method" required <?= !$paymentMethods ? 'disabled' : '' ?>>
+                    <?php if (!$paymentMethods): ?><option value="">Metode pembayaran belum tersedia</option>
+                    <?php else: foreach ($paymentMethods as $method): ?>
+                        <option value="<?= h($method['code']) ?>" <?= $selectedPaymentMethod === $method['code'] ? 'selected' : '' ?>><?= h($method['name']) ?></option>
+                    <?php endforeach; endif; ?>
+                </select>
+            </label>
+            <label class="online-payment-method">Email untuk pembayaran<input type="email" name="customer_email" value="<?= h($checkoutEmail) ?>" maxlength="254" autocomplete="email" required></label>
+            <label class="online-payment-method">Nomor telepon <span class="field-optional">(opsional)</span><input type="tel" name="customer_phone" value="<?= h($checkoutPhone) ?>" maxlength="32" autocomplete="tel"></label>
+            <div class="online-payment-selected"><span>Total pembayaran</span><strong><?= rupiah($total) ?></strong></div>
+            <button class="button button-primary" type="submit" <?= !$duitkuReady ? 'disabled title="Konfigurasi Duitku belum lengkap"' : '' ?>>Pilih pembayaran · <?= rupiah($total) ?></button>
+        </form>
         <?php endif; ?>
     </aside>
 </section>
 <section class="panel section-card" id="pesanan">
-    <div class="panel-header"><div><h2>Riwayat pesanan online</h2><p class="panel-subtitle">Unggah bukti transfer QRIS agar pesanan dapat diverifikasi.</p></div><span class="badge"><?= count($orders) ?> pesanan</span></div>
-    <div class="table-wrap"><table><thead><tr><th>No. pesanan</th><th>Tanggal</th><th>Status pesanan</th><th>Status QRIS</th><th>Total & bukti</th></tr></thead><tbody>
+    <div class="panel-header"><div><h2>Riwayat pesanan online</h2><p class="panel-subtitle">Pembayaran Duitku terkonfirmasi otomatis.</p></div><span class="badge"><?= count($orders) ?> pesanan</span></div>
+    <div class="table-wrap"><table><thead><tr><th>No. pesanan</th><th>Tanggal</th><th>Status pesanan</th><th>Pembayaran</th><th>Total & bukti</th></tr></thead><tbody>
         <?php if (!$orders): ?><tr><td class="table-empty" colspan="5">Belum ada pesanan online.</td></tr>
         <?php else: foreach ($orders as $order): ?><tr>
-            <td><strong><?= h($order['nomor_pesanan']) ?></strong></td>
+            <td><strong><?= h($order['nomor_pesanan']) ?></strong><br><span class="member-city">Referensi toko</span><?php if ($order['duitku_reference']): ?><br><span class="member-city">Referensi Duitku: <?= h($order['duitku_reference']) ?></span><?php endif; ?></td>
             <td><?= h($order['dibuat_pada']) ?></td>
-            <td><span class="badge <?= $order['status'] === 'Dibatalkan' ? 'orange' : '' ?>"><?= h($order['status']) ?></span></td>
-            <td><span class="badge <?= $order['status_pembayaran'] === 'Ditolak' ? 'orange' : '' ?>"><?= h($order['status_pembayaran']) ?></span></td>
+            <td><span class="badge <?= $order['status_pembayaran'] === 'Gagal' || $order['status'] === 'Dibatalkan' ? 'orange' : '' ?>"><?= h($order['status'] === 'Menunggu' && $order['status_pembayaran'] === 'Menunggu pembayaran' && $order['duitku_payment_method'] ? 'Menunggu pembayaran' : ($order['status'] === 'Menunggu' ? 'Siap diambil' : $order['status'])) ?></span></td>
+            <td><?= h($order['duitku_payment_name'] ?: $order['metode_pembayaran']) ?><br><span class="badge <?= in_array($order['status_pembayaran'], ['Ditolak', 'Gagal', 'Dibatalkan'], true) ? 'orange' : '' ?>"><?= h($order['status_pembayaran']) ?></span></td>
             <td><strong><?= rupiah($order['total']) ?></strong>
+                <?php if ($order['duitku_payment_url'] && $order['status_pembayaran'] === 'Menunggu pembayaran'): ?><br><a class="small-link" href="<?= h($order['duitku_payment_url']) ?>" target="_blank" rel="noopener">Lanjutkan pembayaran Duitku</a><?php endif; ?>
                 <?php if ($order['bukti_pembayaran']): ?><br><a class="small-link" href="payment_proof.php?order_id=<?= (int) $order['id_pesanan'] ?>" target="_blank" rel="noopener">Lihat bukti</a><?php endif; ?>
-                <?php if (in_array($order['status_pembayaran'], ['Menunggu pembayaran', 'Ditolak'], true) && !in_array($order['status'], ['Selesai', 'Dibatalkan'], true)): ?>
+                <?php if (!$order['duitku_reference'] && in_array($order['status_pembayaran'], ['Menunggu pembayaran', 'Ditolak'], true) && !in_array($order['status'], ['Selesai', 'Dibatalkan'], true)): ?>
                 <form method="post" enctype="multipart/form-data" class="qris-proof-form">
                     <input type="hidden" name="csrf_token" value="<?= h(csrfToken()) ?>"><input type="hidden" name="action" value="upload_payment_proof"><input type="hidden" name="order_id" value="<?= (int) $order['id_pesanan'] ?>">
                     <label class="qris-proof-file">Pilih bukti<input type="file" name="payment_proof" accept="image/jpeg,image/png,image/webp" required></label>

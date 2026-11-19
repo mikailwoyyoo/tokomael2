@@ -11,7 +11,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $newStatus = (string) ($_POST['status'] ?? '');
         $paymentAction = (string) ($_POST['payment_action'] ?? '');
         if (!$orderId
-            || (!in_array($newStatus, ['Siap diambil', 'Selesai', 'Dibatalkan'], true)
+            || (!in_array($newStatus, ['Selesai', 'Dibatalkan'], true)
                 && !in_array($paymentAction, ['verify', 'reject'], true))) {
             throw new InvalidArgumentException('Perubahan status pesanan tidak valid.');
         }
@@ -25,7 +25,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         if ($paymentAction !== '') {
-            if ($order['metode_pembayaran'] !== 'QRIS'
+            if ($order['duitku_payment_method'] !== null
+                || $order['metode_pembayaran'] !== 'QRIS'
                 || $order['status_pembayaran'] !== 'Menunggu verifikasi'
                 || !$order['bukti_pembayaran']) {
                 throw new InvalidArgumentException('Bukti QRIS belum tersedia atau sudah diproses.');
@@ -57,7 +58,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $currentStatus = (string) $order['status'];
         $allowedTransitions = [
-            'Menunggu' => ['Siap diambil', 'Dibatalkan'],
+            'Menunggu' => ['Selesai', 'Dibatalkan'],
             'Siap diambil' => ['Selesai', 'Dibatalkan'],
         ];
         if (!in_array($newStatus, $allowedTransitions[$currentStatus] ?? [], true)) {
@@ -67,13 +68,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($newStatus === 'Dibatalkan' && $order['status_pembayaran'] === 'Dibayar') {
             throw new InvalidArgumentException('Pesanan yang sudah dibayar QRIS tidak dapat dibatalkan dari halaman ini.');
         }
-
-        if ($newStatus === 'Selesai' && $order['metode_pembayaran'] === 'QRIS'
-            && $order['status_pembayaran'] !== 'Dibayar') {
-            throw new InvalidArgumentException('Verifikasi pembayaran QRIS sebelum menyelesaikan pesanan.');
+        if ($newStatus === 'Dibatalkan'
+            && $order['duitku_payment_method'] !== null
+            && $order['status_pembayaran'] === 'Menunggu pembayaran') {
+            throw new InvalidArgumentException('Invoice Duitku masih aktif. Tunggu status pembayaran dari Duitku sebelum membatalkan pesanan.');
         }
 
-        $transactionId = null;
+        if ($newStatus === 'Selesai' && !in_array($currentStatus, ['Menunggu', 'Siap diambil'], true)) {
+            throw new InvalidArgumentException('Pesanan harus berstatus siap diambil sebelum diselesaikan.');
+        }
+
+        if ($newStatus === 'Selesai'
+            && ($order['duitku_payment_method'] !== null || $order['metode_pembayaran'] === 'QRIS')
+            && $order['status_pembayaran'] !== 'Dibayar') {
+            throw new InvalidArgumentException('Pastikan pembayaran online sudah dikonfirmasi sebelum menyelesaikan pesanan.');
+        }
+
+        $transactionId = $order['id_transaksi'] !== null ? (int) $order['id_transaksi'] : null;
         if ($newStatus === 'Dibatalkan') {
             $detailsQuery = $pdo->prepare(
                 'SELECT id_produk, jumlah FROM tbl_detail_pesanan_online WHERE id_pesanan = ?'
@@ -85,7 +96,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $restoreStock->execute([(int) $detail['jumlah'], (int) $detail['id_produk']]);
                 }
             }
-        } elseif ($newStatus === 'Selesai') {
+        } elseif ($newStatus === 'Selesai' && $transactionId === null) {
             $cashierId = currentRole() === 'cashier' ? currentUserId() : null;
             $createSale = $pdo->prepare(
                 'INSERT INTO tbl_transaksi
@@ -101,7 +112,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 (float) $order['diskon'],
                 (float) $order['pajak'],
                 (float) $order['total'],
-                $order['metode_pembayaran'] === 'QRIS' ? 'QRIS' : 'Tunai',
+                $order['duitku_payment_name'] ?: ($order['metode_pembayaran'] === 'QRIS' ? 'QRIS' : 'Tunai'),
             ]);
             $transactionId = (int) $pdo->lastInsertId();
             $copyDetails = $pdo->prepare(
@@ -121,8 +132,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $updateOrder->execute([$newStatus, $transactionId, $newStatus, $orderId]);
         $pdo->commit();
         setFlash('success', $newStatus === 'Selesai'
-            ? 'Pesanan selesai dan pembayaran ' . ($order['metode_pembayaran'] === 'QRIS' ? 'QRIS' : 'tunai') . ' tercatat ke riwayat transaksi.'
-            : ($newStatus === 'Dibatalkan' ? 'Pesanan dibatalkan dan stok dikembalikan.' : 'Pesanan ditandai siap diambil.'));
+            ? 'Pesanan selesai dan pembayaran ' . ($order['duitku_payment_name'] ?: $order['metode_pembayaran']) . ' tercatat ke riwayat transaksi.'
+            : 'Pesanan dibatalkan dan stok dikembalikan.');
     } catch (Throwable $exception) {
         if ($pdo->inTransaction()) {
             $pdo->rollBack();
@@ -150,7 +161,8 @@ $orders = [];
 try {
     $orders = $pdo->query(
         'SELECT o.id_pesanan, o.nomor_pesanan, o.id_pelanggan, o.status, o.subtotal, o.diskon, o.pajak, o.total,
-                o.metode_pembayaran, o.status_pembayaran, o.bukti_pembayaran, o.dibuat_pada,
+                o.metode_pembayaran, o.status_pembayaran, o.bukti_pembayaran,
+                o.duitku_reference, o.duitku_payment_method, o.duitku_payment_name, o.dibuat_pada,
                 p.nama_pelanggan
          FROM tbl_pesanan_online o
          JOIN tbl_pelanggan p ON p.id_pelanggan = o.id_pelanggan
@@ -167,24 +179,25 @@ try {
 require __DIR__ . '/includes/header.php';
 ?>
 <section class="page-heading">
-    <div><div class="eyebrow">Kelola penjualan online</div><h1>Pesanan Online</h1><p>Siapkan pesanan, verifikasi bukti QRIS, lalu selesaikan pesanan setelah pembayaran dan penyerahan barang dipastikan.</p></div>
+    <div><div class="eyebrow">Kelola penjualan online</div><h1>Pesanan Online</h1><p>Checkout diterima otomatis. Duitku mengonfirmasi pembayaran dan mencatat transaksi; ubah status setelah barang diserahkan.</p></div>
     <a class="button button-secondary" href="<?= currentRole() === 'cashier' ? 'kasir.php' : 'index.php' ?>">← Kembali ke dashboard</a>
 </section>
 <?php if ($flash): ?><div class="notice <?= h($flash['type']) ?>"><?= h($flash['message']) ?></div><?php endif; ?>
 <?php if ($error): ?><div class="notice error"><?= h($error) ?></div><?php endif; ?>
 <section class="panel">
-    <div class="panel-header"><div><h2>Daftar pesanan</h2><p class="panel-subtitle">Maksimal 200 pesanan terbaru. Barang dipesan dan stok dicadangkan saat pelanggan checkout.</p></div><span class="badge"><?= count($orders) ?> pesanan</span></div>
+    <div class="panel-header"><div><h2>Daftar pesanan</h2><p class="panel-subtitle">Maksimal 200 pesanan terbaru. Checkout langsung diterima dan stok dicadangkan otomatis; tidak perlu persetujuan pesanan.</p></div><span class="badge"><?= count($orders) ?> pesanan</span></div>
     <div class="table-wrap"><table><thead><tr><th>Pesanan</th><th>Pelanggan</th><th>Barang</th><th>Pembayaran</th><th>Total</th><th>Status</th><th>Aksi</th></tr></thead><tbody>
         <?php if (!$orders): ?><tr><td class="table-empty" colspan="7"><?= $error ? 'Data tidak tersedia.' : 'Belum ada pesanan.' ?></td></tr>
         <?php else: foreach ($orders as $order): ?>
             <?php $detailsQuery->execute([(int) $order['id_pesanan']]); $details = $detailsQuery->fetchAll(); ?>
             <tr>
-                <td><strong><?= h($order['nomor_pesanan']) ?></strong><br><span class="member-city"><?= h($order['dibuat_pada']) ?></span></td>
+                <td><strong><?= h($order['nomor_pesanan']) ?></strong><br><span class="member-city">Ref. toko · <?= h($order['dibuat_pada']) ?></span></td>
                 <td><?= h($order['nama_pelanggan']) ?></td>
                 <td><?= implode('<br>', array_map(static function (array $detail): string {
                     return h($detail['nama_produk']) . ' × ' . (int) $detail['jumlah'];
                 }, $details)) ?></td>
-                <td><?= h($order['metode_pembayaran']) ?><br><span class="badge <?= in_array($order['status_pembayaran'], ['Ditolak', 'Dibatalkan'], true) ? 'orange' : '' ?>"><?= h($order['status_pembayaran']) ?></span>
+                <td><?= h($order['duitku_payment_name'] ?: $order['metode_pembayaran']) ?><br><span class="badge <?= in_array($order['status_pembayaran'], ['Ditolak', 'Dibatalkan', 'Gagal'], true) ? 'orange' : '' ?>"><?= h($order['status_pembayaran']) ?></span>
+                    <?php if ($order['duitku_reference']): ?><br><span class="member-city">Ref. Duitku: <?= h($order['duitku_reference']) ?></span><?php endif; ?>
                     <?php if ($order['bukti_pembayaran']): ?>
                     <br><a class="small-link" href="payment_proof.php?order_id=<?= (int) $order['id_pesanan'] ?>" target="_blank" rel="noopener">Lihat bukti QRIS</a>
                     <?php if ($order['status_pembayaran'] === 'Menunggu verifikasi'): ?>
@@ -195,16 +208,14 @@ require __DIR__ . '/includes/header.php';
                     <?php endif; endif; ?>
                 </td>
                 <td><strong><?= rupiah($order['total']) ?></strong><br><span class="member-city">Termasuk diskon member & pajak</span></td>
-                <td><span class="badge <?= $order['status'] === 'Dibatalkan' ? 'orange' : '' ?>"><?= h($order['status']) ?></span></td>
+                <td><span class="badge <?= in_array($order['status_pembayaran'], ['Gagal', 'Dibatalkan'], true) ? 'orange' : '' ?>"><?= h($order['status'] === 'Menunggu' && $order['status_pembayaran'] === 'Menunggu pembayaran' && $order['duitku_payment_method'] ? 'Menunggu pembayaran' : ($order['status'] === 'Menunggu' ? 'Siap diambil' : $order['status'])) ?></span></td>
                 <td>
-                    <?php if (in_array($order['status'], ['Menunggu', 'Siap diambil'], true)): ?>
+                    <?php if ($order['status'] === 'Menunggu' && $order['status_pembayaran'] === 'Menunggu pembayaran' && $order['duitku_payment_method']): ?>
+                        <span class="member-city"><?= $order['duitku_reference'] ? 'Menunggu callback pembayaran Duitku.' : 'Invoice Duitku sedang dibuat.' ?></span>
+                    <?php elseif (in_array($order['status'], ['Menunggu', 'Siap diambil'], true)): ?>
                     <div class="online-order-actions">
-                        <?php if ($order['status'] === 'Menunggu'): ?>
-                        <form method="post" data-confirm="Setujui pesanan dan mulai siapkan barang?"><input type="hidden" name="csrf_token" value="<?= h(csrfToken()) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id_pesanan'] ?>"><input type="hidden" name="status" value="Siap diambil"><button class="button button-primary" type="submit">Acc & siapkan</button></form>
-                        <?php else: ?>
-                        <form method="post" data-confirm="<?= $order['metode_pembayaran'] === 'QRIS' ? 'Pastikan pembayaran QRIS sudah diverifikasi dan barang telah diserahkan. Selesaikan pesanan?' : 'Pastikan pembayaran tunai sudah diterima. Selesaikan pesanan?' ?>"><input type="hidden" name="csrf_token" value="<?= h(csrfToken()) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id_pesanan'] ?>"><input type="hidden" name="status" value="Selesai"><button class="button button-primary" type="submit" <?= $order['metode_pembayaran'] === 'QRIS' && $order['status_pembayaran'] !== 'Dibayar' ? 'disabled title="Verifikasi pembayaran QRIS terlebih dahulu"' : '' ?>>Selesaikan & catat</button></form>
-                        <?php endif; ?>
-                        <form method="post" data-confirm="Batalkan pesanan dan kembalikan stok?"><input type="hidden" name="csrf_token" value="<?= h(csrfToken()) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id_pesanan'] ?>"><input type="hidden" name="status" value="Dibatalkan"><button class="button button-secondary" type="submit">Batalkan</button></form>
+                        <form method="post" data-confirm="Pastikan pembayaran telah dikonfirmasi dan barang sudah diserahkan. Selesaikan pesanan?"><input type="hidden" name="csrf_token" value="<?= h(csrfToken()) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id_pesanan'] ?>"><input type="hidden" name="status" value="Selesai"><button class="button button-primary" type="submit" <?= ($order['duitku_payment_method'] !== null || $order['metode_pembayaran'] === 'QRIS') && $order['status_pembayaran'] !== 'Dibayar' ? 'disabled title="Konfirmasi pembayaran terlebih dahulu"' : '' ?>>Selesaikan & catat</button></form>
+                        <?php if ($order['status_pembayaran'] !== 'Dibayar' && !($order['duitku_payment_method'] && $order['status_pembayaran'] === 'Menunggu pembayaran')): ?><form method="post" data-confirm="Batalkan pesanan dan kembalikan stok?"><input type="hidden" name="csrf_token" value="<?= h(csrfToken()) ?>"><input type="hidden" name="order_id" value="<?= (int) $order['id_pesanan'] ?>"><input type="hidden" name="status" value="Dibatalkan"><button class="button button-secondary" type="submit">Batalkan</button></form><?php endif; ?>
                     </div>
                     <?php else: ?><span class="member-city">—</span><?php endif; ?>
                 </td>

@@ -14,11 +14,14 @@ $products = [];
 $onlineOrders = [];
 $dashboardCart = [];
 $dashboardCartTotal = 0.0;
+$dashboardCartDiscount = 0.0;
+$dashboardCartTax = 0.0;
+$dashboardCartGrandTotal = 0.0;
 $points = 0;
 $totalDiscount = 0.0;
 $lifetimeSpend = 0.0;
 $flash = takeFlash();
-$tier = ['name' => 'Reguler', 'class' => 'regular', 'next' => 500000, 'perks' => 'Selamat bergabung di program MKLOYY Member.'];
+$tier = ['name' => 'Reguler', 'class' => 'regular', 'next' => 500000, 'next_name' => 'Silver', 'perks' => 'Selamat bergabung di program MKLOYY Member.'];
 
 try {
     $memberQuery = $pdo->prepare(
@@ -60,6 +63,9 @@ try {
             $dashboardCart[] = $cartProduct;
         }
     }
+    $dashboardCartDiscount = round($dashboardCartTotal * (float) $member['diskon_persen'] / 100, 2);
+    $dashboardCartTax = round(($dashboardCartTotal - $dashboardCartDiscount) * 0.11, 2);
+    $dashboardCartGrandTotal = round($dashboardCartTotal - $dashboardCartDiscount + $dashboardCartTax, 2);
 
     $salesQuery = $pdo->prepare(
         'SELECT id_transaksi, tanggal, total_belanja, diskon
@@ -84,9 +90,9 @@ try {
     $lifetimeSpend = (float) $loyalty['total_belanja'];
 
     if ($lifetimeSpend >= 1000000) {
-        $tier = ['name' => 'Gold', 'class' => 'gold', 'next' => null, 'perks' => 'Level tertinggi MKLOYY Member. Terima kasih atas loyalitas Anda!'];
+        $tier = ['name' => 'Gold', 'class' => 'gold', 'next' => null, 'next_name' => null, 'perks' => 'Level tertinggi MKLOYY Member. Terima kasih atas loyalitas Anda!'];
     } elseif ($lifetimeSpend >= 500000) {
-        $tier = ['name' => 'Silver', 'class' => 'silver', 'next' => 1000000, 'perks' => 'Nikmati status Silver dan lanjutkan belanja untuk meraih Gold.'];
+        $tier = ['name' => 'Silver', 'class' => 'silver', 'next' => 1000000, 'next_name' => 'Gold', 'perks' => 'Nikmati status Silver dan lanjutkan belanja untuk meraih Gold.'];
     }
 
     $promos = $pdo->query(
@@ -102,11 +108,17 @@ try {
          FROM tbl_produk WHERE stok > 0 ORDER BY nama_produk LIMIT 60'
     )->fetchAll();
     $ordersQuery = $pdo->prepare(
-        'SELECT id_pesanan, nomor_pesanan, status, status_pembayaran, total, metode_pembayaran, dibuat_pada
+        "SELECT id_pesanan, nomor_pesanan, status, status_pembayaran, total, duitku_payment_url,
+                duitku_reference, duitku_payment_method, duitku_payment_name,
+                CASE
+                    WHEN status IN ('Menunggu', 'Siap diambil') AND metode_pembayaran = 'Tunai saat ambil' THEN 'QRIS'
+                    ELSE metode_pembayaran
+                END AS metode_pembayaran,
+                dibuat_pada
          FROM tbl_pesanan_online
          WHERE id_member = ?
          ORDER BY dibuat_pada DESC
-         LIMIT 20'
+         LIMIT 20"
     );
     $ordersQuery->execute([(int) $member['id_member']]);
     $onlineOrders = $ordersQuery->fetchAll();
@@ -119,13 +131,22 @@ try {
 require __DIR__ . '/includes/header.php';
 ?>
 <section class="page-heading">
-    <div><div class="eyebrow">Area pelanggan</div><h1>Dashboard Pelanggan</h1><p>Lihat kartu member, promo terbaru, dan belanja produk dengan pembayaran QRIS.</p></div>
-    <a class="button button-primary" href="belanja_online.php">Mulai belanja →</a>
+    <div class="customer-dashboard-intro">
+        <span class="customer-welcome-chip"><span aria-hidden="true">✦</span> MEMBER <?= h(strtoupper($tier['name'])) ?></span>
+        <div class="eyebrow">Area pelanggan</div>
+        <h1>Halo, <?= h($member['nama_pelanggan'] ?? 'Member') ?> 👋</h1>
+        <p>Senang melihat Anda kembali. Nikmati promo dan keuntungan khusus member hari ini.</p>
+    </div>
+    <a class="button button-primary customer-dashboard-cta" href="belanja_online.php"><span aria-hidden="true">＋</span> Mulai belanja</a>
 </section>
 <?php if ($error): ?><div class="notice error"><?= h($error) ?></div><?php endif; ?>
 <?php if ($flash): ?><div class="notice <?= h($flash['type']) ?>"><?= h($flash['message']) ?></div><?php endif; ?>
 <?php if ($member): ?>
-<section class="panel dashboard-cart-panel">
+<section class="customer-qris-card">
+    <div class="customer-qris-copy"><span class="online-qris-icon">▦</span><div><strong>Belanja praktis, pembayaran aman</strong><p>Pilih kanal non-tunai yang tersedia. Pesanan siap diambil setelah pembayaran terkonfirmasi.</p><a class="small-link" href="belanja_online.php">Jelajahi katalog <span aria-hidden="true">→</span></a></div></div>
+    <span class="customer-qris-pending"><span class="customer-secure-dot"></span> Pembayaran aman</span>
+</section>
+<section class="panel dashboard-cart-panel" id="keranjang">
     <div class="panel-header"><div><h2>Keranjang belanja</h2><p class="panel-subtitle"><?= count($dashboardCart) ?> jenis produk menunggu di keranjang Anda</p></div><a class="button button-secondary" href="belanja_online.php">Kelola keranjang</a></div>
     <?php if (!$dashboardCart): ?>
         <div class="dashboard-cart-empty"><span>🛒</span><div><strong>Keranjang Anda masih kosong</strong><p>Tambahkan produk dari katalog untuk mulai memesan.</p></div><a class="small-link" href="#katalog">Lihat katalog →</a></div>
@@ -139,7 +160,11 @@ require __DIR__ . '/includes/header.php';
                 </div>
             <?php endforeach; ?>
             <?php if (count($dashboardCart) > 4): ?><a class="small-link dashboard-cart-more" href="belanja_online.php">+ <?= count($dashboardCart) - 4 ?> produk lainnya</a><?php endif; ?>
-            <div class="dashboard-cart-total"><span>Subtotal sementara</span><strong><?= rupiah($dashboardCartTotal) ?></strong><a class="button button-primary" href="belanja_online.php">Lanjutkan pesanan →</a></div>
+            <div class="dashboard-cart-total">
+                <div class="dashboard-cart-estimate"><span>Subtotal</span><strong><?= rupiah($dashboardCartTotal) ?></strong><span>Diskon member (<?= h(number_format((float) $member['diskon_persen'], 2, ',', '.')) ?>%)</span><strong class="dashboard-cart-savings">− <?= rupiah($dashboardCartDiscount) ?></strong><span>Estimasi total + pajak</span><strong><?= rupiah($dashboardCartGrandTotal) ?></strong></div>
+                <a class="button button-primary" href="belanja_online.php">Lanjutkan pesanan <span aria-hidden="true">→</span></a>
+                <small class="dashboard-cart-estimate-note">Estimasi; total akhir dikonfirmasi saat checkout.</small>
+            </div>
         </div>
     <?php endif; ?>
 </section>
@@ -167,14 +192,14 @@ require __DIR__ . '/includes/header.php';
         </div>
     </article>
     <div class="member-portal-stats">
-        <article class="stat-card member-tier-stat"><div class="stat-top"><span>Level <?= h($tier['name']) ?></span><span class="stat-icon">✦</span></div><div class="stat-value"><?= h($tier['name']) ?></div><div class="stat-foot"><?= h($tier['perks']) ?></div>
-            <?php if ($tier['next'] !== null): ?><div class="tier-progress"><span style="width:<?= (int) min(100, ($lifetimeSpend / $tier['next']) * 100) ?>%"></span></div><div class="stat-foot"><?= rupiah(max(0, $tier['next'] - $lifetimeSpend)) ?> lagi menuju level berikutnya</div><?php endif; ?>
+        <article class="stat-card member-tier-stat"><div class="stat-top"><span>Status keanggotaan</span><span class="stat-icon">✦</span></div><div class="stat-value"><?= h($tier['name']) ?></div><div class="stat-foot"><?= h($tier['perks']) ?></div>
+            <?php if ($tier['next'] !== null): ?><div class="tier-progress" role="progressbar" aria-label="Progres menuju level berikutnya" aria-valuemin="0" aria-valuemax="100" aria-valuenow="<?= (int) min(100, ($lifetimeSpend / $tier['next']) * 100) ?>"><span style="width:<?= (int) min(100, ($lifetimeSpend / $tier['next']) * 100) ?>%"></span></div><div class="stat-foot"><?= rupiah(max(0, $tier['next'] - $lifetimeSpend)) ?> lagi menuju <?= h($tier['next_name']) ?></div><?php endif; ?>
         </article>
-        <article class="stat-card"><div class="stat-top"><span>Total poin</span><span class="stat-icon">✦</span></div><div class="stat-value"><?= number_format($points, 0, ',', '.') ?></div><div class="stat-foot">1 poin untuk setiap Rp10.000 total transaksi</div></article>
-        <article class="stat-card"><div class="stat-top"><span>Diskon terkumpul</span><span class="stat-icon">%</span></div><div class="stat-value"><?= rupiah($totalDiscount) ?></div><div class="stat-foot">Akumulasi diskon pada riwayat belanja</div></article>
+        <article class="stat-card member-points-stat"><div class="stat-top"><span>Total poin</span><span class="stat-icon">✦</span></div><div class="stat-value"><?= number_format($points, 0, ',', '.') ?></div><div class="stat-foot">1 poin untuk setiap Rp10.000 total transaksi</div></article>
+        <article class="stat-card member-savings-stat"><div class="stat-top"><span>Diskon terkumpul</span><span class="stat-icon">%</span></div><div class="stat-value"><?= rupiah($totalDiscount) ?></div><div class="stat-foot">Akumulasi diskon pada riwayat belanja</div></article>
     </div>
 </section>
-<section class="member-slider-section">
+<section class="member-slider-section" id="promo">
     <div class="section-heading-row"><div><div class="eyebrow">Promo pilihan</div><h2>Temukan promo untuk Anda</h2></div>
         <?php if ($promos): ?>
         <div class="slider-controls"><button type="button" aria-label="Iklan sebelumnya" data-slide-prev>←</button><button type="button" aria-label="Iklan berikutnya" data-slide-next>→</button></div>
@@ -222,7 +247,7 @@ require __DIR__ . '/includes/header.php';
     <div class="panel-header"><div><h2>Pesanan online</h2><p class="panel-subtitle">Pantau status pesanan ambil-di-toko Anda.</p></div><a class="small-link" href="belanja_online.php#pesanan">Belanja online →</a></div>
     <div class="table-wrap"><table><thead><tr><th>No. pesanan</th><th>Tanggal</th><th>Status</th><th>Pembayaran</th><th>Total</th></tr></thead><tbody>
         <?php if (!$onlineOrders): ?><tr><td class="table-empty" colspan="5">Belum ada pesanan online.</td></tr>
-        <?php else: foreach ($onlineOrders as $order): ?><tr><td><strong><?= h($order['nomor_pesanan']) ?></strong></td><td><?= h($order['dibuat_pada']) ?></td><td><span class="badge <?= $order['status'] === 'Dibatalkan' ? 'orange' : '' ?>"><?= h($order['status']) ?></span></td><td><?= h($order['metode_pembayaran']) ?><br><span class="member-city"><?= h($order['status_pembayaran']) ?></span></td><td><?= rupiah($order['total']) ?></td></tr><?php endforeach; endif; ?>
+        <?php else: foreach ($onlineOrders as $order): ?><tr><td><strong><?= h($order['nomor_pesanan']) ?></strong><br><span class="member-city">Ref. toko</span><?php if ($order['duitku_reference']): ?><br><span class="member-city">Ref. Duitku: <?= h($order['duitku_reference']) ?></span><?php endif; ?></td><td><?= h($order['dibuat_pada']) ?></td><td><span class="badge <?= in_array($order['status_pembayaran'], ['Gagal', 'Dibatalkan'], true) ? 'orange' : '' ?>"><?= h($order['status'] === 'Menunggu' && $order['status_pembayaran'] === 'Menunggu pembayaran' && $order['duitku_payment_method'] ? 'Menunggu pembayaran' : $order['status']) ?></span></td><td><?= h($order['duitku_payment_name'] ?: $order['metode_pembayaran']) ?><br><span class="member-city"><?= h($order['status_pembayaran']) ?></span><?php if ($order['duitku_payment_url'] && $order['status_pembayaran'] === 'Menunggu pembayaran'): ?><br><a class="small-link" href="<?= h($order['duitku_payment_url']) ?>" target="_blank" rel="noopener">Bayar sekarang →</a><?php endif; ?></td><td><?= rupiah($order['total']) ?></td></tr><?php endforeach; endif; ?>
     </tbody></table></div>
 </section>
 <section class="panel">

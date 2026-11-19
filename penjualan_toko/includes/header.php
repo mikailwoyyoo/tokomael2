@@ -15,9 +15,9 @@ $homePage = ['admin' => 'index.php', 'cashier' => 'kasir.php', 'member' => 'dash
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="assets/css/style.css">
+    <link rel="stylesheet" href="assets/css/style.css?v=role-dashboards-mobile-20261119-2">
 </head>
-<body>
+<body class="app-page role-<?= h($role) ?>">
 <div class="app-shell">
     <aside class="sidebar" id="sidebar">
         <a class="brand" href="<?= h($homePage) ?>"><span class="brand-mark">M</span><span>MKLOYY</span></a>
@@ -33,6 +33,7 @@ $homePage = ['admin' => 'index.php', 'cashier' => 'kasir.php', 'member' => 'dash
             <a class="<?= $activePage === 'admin' ? 'active' : '' ?>" href="admin.php"><span class="nav-icon">✎</span>Kelola Iklan</a>
             <a class="<?= $activePage === 'online-orders' ? 'active' : '' ?>" href="pesanan_online.php"><span class="nav-icon">▤</span>Pesanan Online</a>
             <a class="<?= $activePage === 'qris' ? 'active' : '' ?>" href="qris.php"><span class="nav-icon">▦</span>Pengaturan QRIS</a>
+            <a class="<?= $activePage === 'duitku' ? 'active' : '' ?>" href="duitku_setup.php"><span class="nav-icon">↔</span>Integrasi Duitku</a>
             <a class="<?= $activePage === 'accounts' ? 'active' : '' ?>" href="akun_kasir.php"><span class="nav-icon">♙</span>Akun Kasir</a>
             <a class="<?= $activePage === 'login-cards' ? 'active' : '' ?>" href="kartu_login.php"><span class="nav-icon">▣</span>Kartu Login</a>
             <?php elseif ($role === 'cashier'): ?>
@@ -51,7 +52,7 @@ $homePage = ['admin' => 'index.php', 'cashier' => 'kasir.php', 'member' => 'dash
     </aside>
     <div class="main-shell">
         <header class="topbar">
-            <button type="button" class="menu-toggle" data-menu-toggle aria-label="Buka navigasi">☰</button>
+            <button type="button" class="menu-toggle" data-menu-toggle aria-label="Buka navigasi" aria-expanded="false">☰</button>
             <div class="breadcrumb">MKLOYY <span>/</span> <?= h($pageTitle) ?></div>
             <div class="topbar-right">
                 <span class="today"><?= date('d M Y') ?></span>

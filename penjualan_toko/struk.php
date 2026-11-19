@@ -59,7 +59,7 @@ $pageTitle = 'Struk #' . $transactionId;
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title><?= h($pageTitle) ?> | MKLOYY</title>
-    <link rel="stylesheet" href="assets/css/style.css?v=receipt-watermark-roles-20261118">
+    <link rel="stylesheet" href="assets/css/style.css?v=ui-polish-receipt-20261119">
 </head>
 <body class="receipt-page">
     <div class="receipt-actions">
